@@ -1,0 +1,4 @@
+# Internal company-OS files - never ship to the public website repo
+CLAUDE.md
+memory/
+.claude/
