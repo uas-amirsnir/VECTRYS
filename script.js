@@ -1536,6 +1536,10 @@ function flyEngagement(attacker, launchFrame, site, goodBaseSpeed) {
     let sIm = 1, flying = false, tgtPrev = null;
     const st = { E: site.x, d: site.depth, U: RAIL_U,
                  psi: 0, turn: 0, vU: 0, baseSpeed: goodBaseSpeed };
+    // The flight must READ as a climb-out: its screen track may only rise
+    // from the rail to the merge. A timing whose opening bearing points
+    // south of the site would dip first - it is not a solution.
+    let minY = groundScreenY(site.x, site.depth, gGeom) - RAIL_U;
 
     for (let f = 0; f < 8000; f++) {
         // Order mirrors the live loop exactly: the interceptor is released
@@ -1554,6 +1558,10 @@ function flyEngagement(attacker, launchFrame, site, goodBaseSpeed) {
 
         if (flying) {
             steerInterceptor3D(st, tgt, tgtPrev, gGeom);
+
+            const iyNow = groundScreenY(st.E, st.d, gGeom) - st.U;
+            if (iyNow > minY + 1.2) return null;
+            minY = Math.min(minY, iyNow);
 
             // Contact is a WORLD proximity - same place on the range, same
             // height over it - never a screen overlap between different
