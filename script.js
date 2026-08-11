@@ -1304,34 +1304,63 @@ function drawSky() {
     ctx.fillRect(0, 0, width, groundY + 2);
 }
 
-// A raid: three to seven attackers converging on one protected site. Every
-// track is anchored on that site, so the group fans out at range and closes on
-// a single aimpoint. Each attacker is engaged separately, at its own point
-// along the way in, which is what makes it read as a layered defence rather
-// than one duel repeated.
+// A raid: attackers converging on one protected city, each engaged
+// separately at its own point along the way in - a layered defence rather
+// than one duel repeated. Planning is INCREMENTAL: forming a wave runs many
+// flight simulations, so the work is spread ONE PAIR PER FRAME - the craft
+// crest and ride the ridge while their engagements are booked, and the
+// animation never hitches.
+let wavePlan = null;
+
 function scheduleRaid() {
-    // A roll that cannot form a wave against one city tries the others
-    // before giving up - one awkward geometry must not quiet the sky.
-    const order = [...majorCities].sort(() => Math.random() - 0.5);
-    for (const city of order) {
-        if (tryRaidAt(city)) return;
+    // A geometry that cannot form a wave against one city tries the others
+    // - an awkward roll must not quiet the sky.
+    wavePlan = { cities: [...majorCities].sort(() => Math.random() - 0.5),
+                 ctx: null, done: false, formed: false };
+}
+
+function stepRaidPlan() {
+    if (!wavePlan || wavePlan.done) return;
+    const ctx = wavePlan.ctx;
+    if (!ctx) {
+        const city = wavePlan.cities.shift();
+        if (!city) { wavePlan.done = true; return; }
+        wavePlan.ctx = beginCityPlan(city);
+        return;
+    }
+    ctx.age++;
+    if (ctx.idx < ctx.pairs.length) {
+        planOnePair(ctx, ctx.pairs[ctx.idx]);
+        ctx.idx++;
+        return;
+    }
+    // The city's plan is complete: keep the wave, or stand it down and try
+    // the next city.
+    if (ctx.placed < (INSPECT ? 2 : 4)) {
+        pendingLaunches.splice(ctx.queuedBefore).forEach(L => {
+            L.plane.reserved = false;
+            L.target.active = false;
+        });
+        for (const pr of ctx.pairs) if (!pr.committed) pr.attacker.active = false;
+        wavePlan.ctx = null;
+    } else {
+        wavePlan.done = true;
+        wavePlan.formed = true;
     }
 }
 
-function tryRaidAt(city) {
+function beginCityPlan(city) {
     const freeAttackers = planes.filter(p => !p.active && !p.reserved);
     const freeInterceptors = goodPlanes.filter(p => !p.active && !p.reserved);
 
     const wanted = INSPECT ? 2
                  : 5 + Math.floor(Math.random() * 6);   // 5..10
     const size = Math.min(wanted, freeAttackers.length, freeInterceptors.length);
-    if (size < (INSPECT ? 2 : 4)) return false;
+    if (size < (INSPECT ? 2 : 4)) return null;
 
     const g = sceneGeometry();
     const { groundY } = g;
 
-    // The place under attack is the given city; its batteries stand in
-    // front of it.
     const aimX = city.x;
     const aimY = city.y - 6;
     // The city's own depth line: every kill must close north of it.
@@ -1339,25 +1368,17 @@ function tryRaidAt(city) {
 
     const speedScale = Math.max(0.3, width / 1440);
     // The interceptor's WORLD speed over the ground - the planner and
-    // launch3D must use the same number. Larger than the old screen speed
-    // because a world pixel of north shows as only 0.16px on screen.
+    // launch3D must use the same number.
     const goodBaseSpeed = (42 / 60) * speedScale;
 
-    // A raid may be co-ordinated on more than one axis: the group splits and
-    // comes at the same site from two or three separate bearings at once.
-    // Bearings are drawn from the whole half-circle of sky, horizon to horizon
-    // through overhead, and kept apart so the axes read as distinct.
+    // A raid may be co-ordinated on more than one axis, the crossing points
+    // kept apart so the axes read as distinct approach corridors.
     const axisCount = size >= 6 ? 1 + Math.floor(Math.random() * 3)
                     : size >= 4 ? 1 + Math.floor(Math.random() * 2)
                     : 1;
-
-    // The raid comes over the horizon. Each axis is a crossing point on the
-    // ridge, kept apart so the axes read as distinct approach corridors.
     const axes = [];
     for (let a = 0; a < axisCount; a++) {
         for (let tries = 0; tries < 24; tries++) {
-            // A minimum lateral offset keeps every run flying across the
-            // field rather than dropping onto its target from above.
             const side = Math.random() < 0.5 ? -1 : 1;
             const off = side * (0.24 + Math.random() * 0.42) * width;
             const crossX = Math.max(30, Math.min(width - 30, aimX + off));
@@ -1370,166 +1391,154 @@ function tryRaidAt(city) {
                                    : Math.max(30, aimX - width * 0.3));
     }
 
-    const ripple = 7;
-    const queuedBefore = pendingLaunches.length;
-    let placed = 0;
+    const ctx = {
+        g, groundY, aimX, aimY, cityDepth, goodBaseSpeed, axes,
+        ripple: 7,
+        queuedBefore: pendingLaunches.length,
+        placed: 0,
+        lastAt: -Infinity,
+        lastLaunch: -Infinity,
+        idx: 0,
+        age: 0,
+        pairs: []
+    };
 
     // Crest the far ridge at the axis point, then down through the depth
     // field. The bow bends the run sideways so it arrives on a curve, capped
     // against its own lateral span so it can never cancel the crossing.
-    const rollIngress = (attacker, i, attempt) => {
+    // rollAge records WHEN the run was (re)rolled, so bookings can convert
+    // the simulation's crest-zero timeline into live countdown frames.
+    ctx.rollIngress = (pair, attempt) => {
         const spreadStep = width * 0.035;
         const sx = Math.max(20, Math.min(width - 20,
-            axes[(i + attempt) % axes.length]
+            ctx.axes[(pair.i + attempt) % ctx.axes.length]
             + (Math.random() - 0.5) * 2 * spreadStep
-            + Math.floor(i / axes.length) * spreadStep * (Math.random() < 0.5 ? -1 : 1)));
-        // Born ON the crest line, not on the mountain's shadow face: the
-        // clamp in setAttackRun pins the birth depth to the ridge itself, so
-        // the craft pops over the silhouette and then descends inbound.
-        const sy = horizonYAt(sx, groundY) - 4;
-        attacker.spawn(sy, null, sx, sx > aimX ? -1 : 1);
-        // Kept gentle: a deep bow makes a run look near a site while its
-        // path time says otherwise, and the kill order stops reading right.
+            + Math.floor(pair.i / ctx.axes.length) * spreadStep * (Math.random() < 0.5 ? -1 : 1)));
+        // Born ON the crest line: the clamp in setAttackRun pins the birth
+        // depth to the ridge itself, so the craft pops over the silhouette.
+        const sy = horizonYAt(sx, ctx.groundY) - 4;
+        pair.attacker.spawn(sy, null, sx, sx > ctx.aimX ? -1 : 1);
         const bow = (Math.random() < 0.5 ? -1 : 1)
-            * Math.min(width * (0.015 + Math.random() * 0.035), Math.abs(sx - aimX) * 0.18);
-        attacker.setAttackRun(sx, sy, aimX, aimY, bow);
+            * Math.min(width * (0.015 + Math.random() * 0.035), Math.abs(sx - ctx.aimX) * 0.18);
+        pair.attacker.setAttackRun(sx, sy, ctx.aimX, ctx.aimY, bow);
+        pair.rollAge = ctx.age;
     };
 
-    // Frames until a run reaches its aimpoint - the urgency of the threat.
+    // Frames until a run reaches its aimpoint - a coarse arc length is
+    // enough: only the ORDER of arrivals matters.
     const framesToImpact = attacker => {
-        let s = 1;
-        for (let f = 0; f < 8000; f++) {
-            s -= attacker.stepAt(s);
-            if (s <= 0) return f;
+        let len = 0, prev = attacker.posAt(1);
+        for (let k = 1; k <= 24; k++) {
+            const p = attacker.posAt(1 - k / 24);
+            len += Math.hypot(p.x - prev.x, p.y - prev.y);
+            prev = p;
         }
-        return 8000;
+        return len / Math.max(attacker.baseSpeed, 0.001);
     };
-
-    // The whole wave crests first; then the defence answers in threat order.
-    // All craft fly the same speed, so the attacker that would arrive first
-    // IS the closest one on the screen at every moment - engage and kill it
-    // first, and the first interceptor also flies the shortest run.
     const distToSites = attacker =>
         Math.min(...sites.map(s => Math.hypot(s.x - attacker.x, s.y - attacker.y)));
-    const pairs = [];
+
+    // The whole wave crests NOW; the defence answers in threat order, one
+    // engagement booked per frame while the raiders ride the crest.
     for (let i = 0; i < size; i++) {
-        const attacker = freeAttackers[i];
-        rollIngress(attacker, i, 0);
-        pairs.push({ attacker, interceptor: freeInterceptors[i], i,
-                     eta: framesToImpact(attacker),
-                     dist: distToSites(attacker) });
+        const pair = { attacker: freeAttackers[i], interceptor: freeInterceptors[i],
+                       i, committed: false, rollAge: 0 };
+        ctx.rollIngress(pair, 0);
+        pair.eta = framesToImpact(pair.attacker);
+        pair.dist = distToSites(pair.attacker);
+        ctx.pairs.push(pair);
     }
-    pairs.sort((a, b) => (a.eta - b.eta) || (a.dist - b.dist));
+    ctx.pairs.sort((a, b) => (a.eta - b.eta) || (a.dist - b.dist));
+    return ctx;
+}
 
-    // Contacts must land in threat order: each engagement may only close
-    // after the one planned before it, so the closest attacker dies first.
-    // Launches follow the same order - an interceptor sent at a far target
-    // never leaves before the one meeting the near target, so it is never
-    // seen passing a live threat on its way out.
-    let lastAt = -Infinity;
-    let lastLaunch = -Infinity;
+// Book one attacker's engagement: contacts and launches must land in threat
+// order - the closest attacker dies first, and an interceptor sent at a far
+// target never leaves before the one meeting the near target.
+function planOnePair(ctx, pair) {
+    const g = ctx.g;
+    const attacker = pair.attacker;
+    const interceptor = pair.interceptor;
+    let committed = false;
 
-    for (const pair of pairs) {
-        const attacker = pair.attacker;
-        const interceptor = pair.interceptor;
-        let committed = false;
+    // A pair whose geometry yields no achievable engagement re-rolls its
+    // ingress and tries again, so a planned seven-ship raid arrives as
+    // seven, not as whatever happened to survive the first dice.
+    for (let attempt = 0; attempt < 3 && !committed; attempt++) {
+        if (attempt > 0) ctx.rollIngress(pair, attempt);
 
-        // A pair whose geometry yields no achievable engagement re-rolls its
-        // ingress and tries again, so a planned seven-ship raid arrives as
-        // seven, not as whatever happened to survive the first dice.
-        for (let attempt = 0; attempt < 3 && !committed; attempt++) {
-            if (attempt > 0) rollIngress(attacker, pair.i, attempt);
+        // Respond only to what is on the board, after a short delay.
+        const detected = detectionFrame(attacker, g);
+        if (detected === null) continue;
 
-            // Respond only to what is on the board, after a short delay.
-            const detected = detectionFrame(attacker, g);
-            if (detected === null) continue;
+        // The engagement belongs to the site closest to where the fight
+        // will happen: the middle of this attacker's run. That site is on
+        // the raid's own road - never a rail across the screen. If it has
+        // no achievable timing, the ingress re-rolls rather than the shot
+        // wandering to a flank.
+        const midTrack = [];
+        for (let ss = 0.86; ss > 0.45; ss -= 1 / 24) midTrack.push(attacker.posAt(ss));
+        const distToTrack = site =>
+            Math.min(...midTrack.map(pt => Math.hypot(site.x - pt.x, site.y - pt.y)));
+        const batteries = [...sites]
+            .sort((a, b) => distToTrack(a) - distToTrack(b))
+            .slice(0, 1);
 
-            // The engagement belongs to the site closest to where the fight
-            // will happen: the middle of this attacker's run. That site is
-            // on the raid's own road - never a rail across the screen - and
-            // launching early from it meets the raider head-on, which the
-            // gate below still enforces. If it has no achievable timing, the
-            // ingress re-rolls rather than the shot wandering to a flank.
-            const midTrack = [];
-            for (let ss = 0.86; ss > 0.45; ss -= 1 / 24) midTrack.push(attacker.posAt(ss));
-            const distToTrack = site =>
-                Math.min(...midTrack.map(pt => Math.hypot(site.x - pt.x, site.y - pt.y)));
-            const batteries = [...sites]
-                .sort((a, b) => distToTrack(a) - distToTrack(b))
-                .slice(0, 1);
+        // Only commit to timings the flight model confirms.
+        const earliest = detected + REACTION_FRAMES + ctx.placed * ctx.ripple;
+        let chosen = null, chosenAt = 0, launchSite = null;
 
-            // Only commit to timings the flight model confirms.
-            const earliest = detected + REACTION_FRAMES + placed * ripple;
-            let chosen = null, chosenAt = 0, launchSite = null;
-
-            outer:
-            for (const from of batteries) {
-                for (const delay of [0, 20, 40, 65, 90, 115]) {
-                    const launchFrame = Math.ceil(earliest + delay);
-                    // Systematic: the launch leaves within three seconds of
-                    // this track's detection, or the ingress re-rolls.
-                    if (launchFrame - detected > LAUNCH_DEADLINE) break;
-                    const shot = flyEngagement(attacker, launchFrame, from, goodBaseSpeed);
-                    // Contact must come with the nose near the horizon:
-                    // climb to altitude first, finish the run level. The
-                    // slope gate alone enforces it - a climbing contact is
-                    // steeper than 0.42 by construction.
-                    // headOn: the planner's floor on how opposed the merge
-                    // closes; the meeting-point law drives the real angle
-                    // far tighter than this safety bound.
-                    // sAtContact >= 0.6: most of the run must still be ahead
-                    // of the target when it dies, and the contact zone runs
-                    // out past the drawn footprint - kills land far forward,
-                    // out where the detection first marked them. dContact:
-                    // the kill closes strictly BEFORE the first city line -
-                    // the town watches the raid die out in the field, never
-                    // over its own roofs.
-                    if (shot && insideCoverage(shot.x, shot.y, g, 1.15)
-                             && shot.sAtContact >= 0.6
-                             && shot.dContact <= cityDepth - 0.1
-                             && shot.slope <= 0.42
-                             && shot.headOn <= -0.5
-                             && shot.drawnGap <= 1.2
-                             && shot.dU <= 2
-                             && shot.at >= lastAt
-                             && launchFrame >= lastLaunch) {
-                        chosen = launchFrame;
-                        chosenAt = shot.at;
-                        launchSite = from;
-                        break outer;
-                    }
+        outer:
+        for (const from of batteries) {
+            for (const delay of [0, 20, 40, 65, 90, 115]) {
+                const launchFrame = Math.ceil(earliest + delay);
+                // Systematic: the launch leaves within the deadline after
+                // this track's detection, or the ingress re-rolls.
+                if (launchFrame - detected > LAUNCH_DEADLINE) break;
+                const shot = flyEngagement(attacker, launchFrame, from, ctx.goodBaseSpeed);
+                // Gates: contact level (slope), opposed (headOn floor - the
+                // meeting-point law drives the real angle far tighter), far
+                // out (sAtContact), before the first city line (dContact),
+                // drawn track converged (drawnGap), heights aligned (dU),
+                // and in threat order (at/launch monotonic).
+                if (shot && insideCoverage(shot.x, shot.y, g, 1.15)
+                         && shot.sAtContact >= 0.6
+                         && shot.dContact <= ctx.cityDepth - 0.1
+                         && shot.slope <= 0.42
+                         && shot.headOn <= -0.5
+                         && shot.drawnGap <= 1.2
+                         && shot.dU <= 2
+                         && shot.at >= ctx.lastAt
+                         && launchFrame >= ctx.lastLaunch) {
+                    chosen = launchFrame;
+                    chosenAt = shot.at;
+                    launchSite = from;
+                    break outer;
                 }
             }
-
-            if (chosen === null) continue;
-
-            interceptor.reserved = true;
-            pendingLaunches.push({
-                plane: interceptor,
-                x: launchSite.x,
-                d: launchSite.depth,
-                target: attacker,
-                frames: chosen,
-                speed: goodBaseSpeed
-            });
-            lastAt = chosenAt;
-            lastLaunch = chosen;
-            committed = true;
-            placed++;
         }
 
-        if (!committed) attacker.active = false;
+        if (chosen === null) continue;
+
+        interceptor.reserved = true;
+        pendingLaunches.push({
+            plane: interceptor,
+            x: launchSite.x,
+            d: launchSite.depth,
+            target: attacker,
+            // The simulation counts from this run's crest; the live craft
+            // has already flown (age - rollAge) frames of it.
+            frames: Math.max(1, chosen - (ctx.age - pair.rollAge)),
+            speed: ctx.goodBaseSpeed
+        });
+        ctx.lastAt = chosenAt;
+        ctx.lastLaunch = chosen;
+        committed = true;
+        pair.committed = true;
+        ctx.placed++;
     }
 
-    // Too few survivors: withdraw the wave.
-    if (placed < (INSPECT ? 2 : 4)) {
-        pendingLaunches.splice(queuedBefore).forEach(L => {
-            L.plane.reserved = false;
-            L.target.active = false;
-        });
-        return false;
-    }
-    return true;
+    if (!committed) attacker.active = false;
 }
 
 // The system's rhythm, in frames after a track's detection: three seconds
@@ -1659,7 +1668,9 @@ function flyEngagement(attacker, launchFrame, site, goodBaseSpeed) {
         }
 
         sIm -= attacker.stepAt(sIm);
-        if (sIm <= 0) return null;               // target reached the site
+        // Past the far-kill line no contact can be accepted anyway - stop
+        // simulating. This is what keeps a planning frame cheap.
+        if (sIm < 0.55) return null;
         const tgt = attacker.worldAt(sIm);
 
         if (flying) {
@@ -1716,18 +1727,22 @@ function animate(time) {
     // Raids come in waves: the sky clears, then the next one arrives.
     // Waves ROLL: the next raid may crest while the last few of the
     // previous one are still being run down - the sky never stands empty.
+    // Planning is incremental: one engagement is booked per frame.
     {
-        const aloft = planes.filter(p => p.active || p.reserved).length;
-        if (aloft <= 2 && pendingLaunches.length <= 2) {
-            if (--raidCooldown <= 0) {
-                const before = planes.filter(p => p.active || p.reserved).length;
-                scheduleRaid();
-                const formed = planes.filter(p => p.active || p.reserved).length > before;
+        if (wavePlan) {
+            stepRaidPlan();
+            if (wavePlan.done) {
                 // A roll that failed to form a wave retries almost at once -
                 // a failed roll must never cost the viewer a quiet spell.
                 raidCooldown = INSPECT ? 60
-                    : formed ? 60 + Math.random() * 130
+                    : wavePlan.formed ? 60 + Math.random() * 130
                     : 25;
+                wavePlan = null;
+            }
+        } else {
+            const aloft = planes.filter(p => p.active || p.reserved).length;
+            if (aloft <= 2 && pendingLaunches.length <= 2) {
+                if (--raidCooldown <= 0) scheduleRaid();
             }
         }
     }
