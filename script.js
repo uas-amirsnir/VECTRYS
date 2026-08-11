@@ -148,6 +148,8 @@ class Plane {
         this.trailOpacity = 1.0;
         this.trail = [];
         this.target = target;
+        this.lockT = null;
+        this.guidedMark = false;
 
         // Scale speed with width so a crossing takes a similar time on any
         // screen. Clamped so it does not crawl on a phone.
@@ -188,15 +190,29 @@ class Plane {
         this.heading = Math.atan2(ay - sy, ax - sx);
     }
 
+    // Depth settles early (s^1.9): the run drops to the site's depth while
+    // still far out, then flies the rest level - so the terminal phase and
+    // the intercept read as horizontal flight over the ground. The crest
+    // hold keeps the first instants ON the ridge silhouette, so the craft
+    // rises from behind the mountains instead of forming on their shadow.
+    // This is the run's TRUE depth - detection and the world map both key
+    // on it, never on a screen position.
+    depthOfS(s) {
+        const settle = Math.min(1, (1 - s) / 0.035);
+        const dRaw = this.d0 + (this.d1 - this.d0) * Math.pow(s, 1.9);
+        return this.d1 + (dRaw - this.d1) * settle;
+    }
+
     posAt(s) {
         const x = this.A.x + (this.S.x - this.A.x) * s + this.bow * Math.sin(Math.PI * s);
-        // Depth settles early (s^1.9): the run drops to the site's depth while
-        // still far out, then flies the rest level - so the terminal phase and
-        // the intercept read as horizontal flight over the ground.
-        const d = this.d0 + (this.d1 - this.d0) * Math.pow(s, 1.9);
+        const d = this.depthOfS(s);
         const h = horizonYAt(x, this.gY);
         const hov = this.hover * Math.min(1, (1 - s) * 6);
-        return { x, y: h + d * (this.near - h) - hov };
+        // The birth climb: the craft starts BELOW the crest, behind the
+        // silhouette, and rises over it - the ridge clip in the drawing
+        // hides whatever is still behind the mountain.
+        const emerge = Math.max(0, (s - 0.98) / 0.02);
+        return { x, y: h + d * (this.near - h) - hov + emerge * 16 };
     }
 
     // Constant speed along the curve via numeric tangent, quickening
@@ -217,7 +233,7 @@ class Plane {
         const p = this.posAt(s);
         return {
             E: p.x,
-            d: this.d0 + (this.d1 - this.d0) * Math.pow(s, 1.9),
+            d: this.depthOfS(s),
             U: this.hover * Math.min(1, (1 - s) * 6),
             // The height this run settles at - the line an interceptor
             // should fly to meet it, constant for the whole engagement.
@@ -252,6 +268,7 @@ class Plane {
         this.tgtPrev = t;
         this.x = E;
         this.y = groundScreenY(E, d, g) - this.U;
+        this.minY = this.y;
         this.prevX = this.x;
         this.prevY = this.y;
         this.heading = 0;
@@ -298,12 +315,24 @@ class Plane {
                 steerInterceptor3D(this, tgt, this.tgtPrev || tgt, g2);
                 this.tgtPrev = tgt;
             } else {
-                // Target gone: fly on along the last bearing.
+                // Target gone: drop the reference - the craft object may be
+                // recycled into a new wave, and a stale lock would guide (and
+                // kill) a newborn the frame it crests - and fly on along the
+                // last bearing.
+                this.target = null;
                 this.E += Math.cos(this.psi) * this.baseSpeed;
                 this.d -= Math.sin(this.psi) * this.baseSpeed / northSpan(g2);
             }
             this.x = this.E;
             this.y = groundScreenY(this.E, this.d, g2) - this.U;
+            // The picture may only climb. The flight holds its height above
+            // the ground UNDER it, so terrain rolling beneath would wave the
+            // projected track; the drawn track flattens the roll and never
+            // gives back a pixel. World state - and every guarantee built on
+            // it - is untouched.
+            if (this.minY === undefined) this.minY = this.y;
+            this.minY = Math.min(this.minY, this.y);
+            this.y = this.minY;
         }
 
         if (this.isEnemy) {
@@ -335,7 +364,9 @@ class Plane {
         // field. This is what carries the third dimension.
         this.vis = 0.3 + 0.85 * Math.max(0, Math.min(1.1,
             this.isEnemy ? depthAt(this.x, this.y, sceneGeometry()) : this.d));
-        this.opacity = this.isEnemy ? Math.min(1, (1 - this.s) * 16) : 1.0;
+        // The raider appears fast and crisp at the crest - rising from
+        // behind the ridge, not fading in on its shadow.
+        this.opacity = this.isEnemy ? Math.min(1, (1 - this.s) * 45) : 1.0;
         this.trailOpacity = this.opacity;
 
         if (!this.isEnemy || this.s < 0.975) {
@@ -435,7 +466,7 @@ class Plane {
     }
 
     drawPlaneSprite(ctx2, img, loaded, x, y) {
-        const baseSize = (window.innerWidth < 600 ? 25 : 27) * (this.vis || 1)
+        const baseSize = (window.innerWidth < 600 ? 25 : 21) * (this.vis || 1)
                        * (INSPECT ? 3 : 1);
         const sizePx = this.isEnemy ? baseSize : baseSize * 0.8;
         // Both craft draw from their WORLD attitude. Attacker: its screen
@@ -450,8 +481,26 @@ class Plane {
         const pitch = this.isEnemy
             ? 0
             : -(this.pitch || 0);
+
+        // While a raider is still climbing over the crest, the mountain
+        // hides everything below its silhouette: only the part that has
+        // cleared the ridge line shows.
+        const emerging = this.isEnemy && this.s > 0.975 && this.gY !== undefined;
+        if (emerging) {
+            ctx.save();
+            const x0 = x - sizePx * 1.6, x1 = x + sizePx * 1.6;
+            ctx.beginPath();
+            ctx.moveTo(x0, 0);
+            for (let xx = x0; xx <= x1 + 6; xx += 7) {
+                ctx.lineTo(xx, horizonYAt(xx, this.gY) + 1);
+            }
+            ctx.lineTo(x1, 0);
+            ctx.closePath();
+            ctx.clip();
+        }
         drawCraft(x, y, this.isEnemy ? 'hostile' : 'interceptor',
                   yaw, this.bank || 0, pitch, sizePx, this.opacity);
+        if (emerging) ctx.restore();
     }
 
 }
@@ -459,11 +508,13 @@ class Plane {
 // Interceptors committed to a target, waiting out their lead before launching
 let pendingLaunches = [];
 
-// Frames until the next raid may form, counted only while the sky is clear
-let raidCooldown = 90;
+// Frames until the next raid may form, counted only while the sky is clear.
+// Short at page load: the visitor should not stare at an empty sky.
+let raidCooldown = 40;
 
-// Sized for the largest raid, one interceptor committed per attacker.
-const RAID_MAX = 10;
+// Pool sized for two raids in the air at once - the next wave crests while
+// the last one is still being finished, one interceptor per attacker.
+const RAID_MAX = 16;
 const planes = Array.from({ length: RAID_MAX }, () => new Plane(true));
 const goodPlanes = Array.from({ length: RAID_MAX }, () => new Plane(false));
 
@@ -955,7 +1006,9 @@ function layoutSites() {
     // The battery stands between the city it shields and the horizon the
     // threat comes over - forward of the town, never inside it.
     sites = majorCities.map((c, i) => {
-        const depth = Math.max(0.14, c.depth * 0.4);
+        // Well forward: the meets then close under the ridge by geometry,
+        // far above the town glow.
+        const depth = Math.max(0.12, c.depth * 0.32);
         const x = Math.max(30, Math.min(width - 30,
             c.x + (Math.random() - 0.5) * width * 0.05));
         const horizon = horizonYAt(x, groundY);   // same datum as the gate
@@ -1150,13 +1203,13 @@ function drawDome(time) {
 }
 
 // --- Detection symbols ---
-function drawLock(x, y, size, alpha) {
+function drawLock(x, y, size, alpha, guided) {
     const h = size / 2;
     const arm = size * 0.3;
 
     ctx.save();
     ctx.strokeStyle = `rgba(${LOCK_RGB}, ${alpha})`;
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = guided ? 1.8 : 1.2;
     ctx.lineCap = 'square';
     ctx.beginPath();
     ctx.moveTo(x - h, y - h + arm); ctx.lineTo(x - h, y - h); ctx.lineTo(x - h + arm, y - h);
@@ -1164,6 +1217,15 @@ function drawLock(x, y, size, alpha) {
     ctx.moveTo(x + h, y + h - arm); ctx.lineTo(x + h, y + h); ctx.lineTo(x + h - arm, y + h);
     ctx.moveTo(x - h + arm, y + h); ctx.lineTo(x - h, y + h); ctx.lineTo(x - h, y + h - arm);
     ctx.stroke();
+
+    // The guiding mark carries a centre dot: the track is no longer just
+    // seen, it is being flown at.
+    if (guided) {
+        ctx.fillStyle = `rgba(${LOCK_RGB}, ${Math.min(1, alpha * 1.4)})`;
+        ctx.beginPath();
+        ctx.arc(x, y, Math.max(1.2, size * 0.045), 0, Math.PI * 2);
+        ctx.fill();
+    }
     ctx.restore();
 }
 
@@ -1173,26 +1235,43 @@ function drawLocks() {
     planes.forEach(enemy => {
         if (!enemy.active || enemy.dying) return;
 
-        // A detection symbol only exists where there is detection: inside the
-        // network's coverage, fading out over the last of the range rather
-        // than blinking off at the edge.
-        const q = Math.sqrt(coverageQ(enemy.x, enemy.y, g, DETECT_MARGIN));
-        if (q > 1) return;
-        const inCoverage = Math.min(1, (1 - q) / 0.12);
+        // A detection symbol exists the moment the track shows over the real
+        // horizon - by its TRUE depth, so the mark never appears while the
+        // craft is still climbing out from behind the crest.
+        const dEnemy = enemy.depthOfS(enemy.s);
+        if (dEnemy < DETECT_DEPTH) return;
+        const inCoverage = Math.min(1, (dEnemy - DETECT_DEPTH) / 0.025);
 
+        // The mark changes state a beat after detection: a wide early-
+        // detection box on the crest, then - once the track is held - the
+        // tighter, brighter guiding mark, which also takes over the moment
+        // an interceptor is in the air.
+        // One-way street: the guiding mark takes over AT the launch - which
+        // the planner books one to three seconds after detection - and once
+        // under guidance a track NEVER falls back to a search box.
+        let guided = enemy.guidedMark === true;
         let nearest = Infinity;
         goodPlanes.forEach(good => {
             if (!good.active || good.dying) return;
+            if (good.target === enemy) guided = true;
             const d = Math.hypot(enemy.x - good.x, enemy.y - good.y);
             if (d < nearest) nearest = d;
         });
+        if (guided) enemy.guidedMark = true;
 
         const closeness = nearest === Infinity
             ? 0
             : Math.max(0, Math.min(1, 1 - nearest / 900));
 
+        // Early detection wears a wide, generous box - clearly visible the
+        // moment the track rises from the horizon - which hands over to the
+        // tighter guiding mark hugging the craft.
         const base = (window.innerWidth < 600 ? 54 : 62) * (enemy.vis || 1);
-        drawLock(enemy.x, enemy.y, base - 14 * closeness, (0.3 + closeness * 0.5) * inCoverage);
+        const size = guided ? base * 0.8 - 12 * closeness
+                            : Math.max(base, window.innerWidth < 600 ? 26 : 32);
+        const alpha = guided ? (0.5 + closeness * 0.4) * inCoverage
+                             : 0.42 * inCoverage;
+        drawLock(enemy.x, enemy.y, size, alpha, guided);
     });
 }
 
@@ -1231,21 +1310,32 @@ function drawSky() {
 // along the way in, which is what makes it read as a layered defence rather
 // than one duel repeated.
 function scheduleRaid() {
+    // A roll that cannot form a wave against one city tries the others
+    // before giving up - one awkward geometry must not quiet the sky.
+    const order = [...majorCities].sort(() => Math.random() - 0.5);
+    for (const city of order) {
+        if (tryRaidAt(city)) return;
+    }
+}
+
+function tryRaidAt(city) {
     const freeAttackers = planes.filter(p => !p.active && !p.reserved);
     const freeInterceptors = goodPlanes.filter(p => !p.active && !p.reserved);
 
     const wanted = INSPECT ? 2
-                 : 5 + Math.floor(Math.random() * (RAID_MAX - 4));   // 5..10
+                 : 5 + Math.floor(Math.random() * 6);   // 5..10
     const size = Math.min(wanted, freeAttackers.length, freeInterceptors.length);
-    if (size < (INSPECT ? 2 : 4)) return;
+    if (size < (INSPECT ? 2 : 4)) return false;
 
     const g = sceneGeometry();
     const { groundY } = g;
 
-    // The place under attack is a city; the batteries stand in front of it.
-    const city = majorCities[Math.floor(Math.random() * majorCities.length)];
+    // The place under attack is the given city; its batteries stand in
+    // front of it.
     const aimX = city.x;
     const aimY = city.y - 6;
+    // The city's own depth line: every kill must close north of it.
+    const cityDepth = depthAt(aimX, aimY, g);
 
     const speedScale = Math.max(0.3, width / 1440);
     // The interceptor's WORLD speed over the ground - the planner and
@@ -1293,7 +1383,10 @@ function scheduleRaid() {
             axes[(i + attempt) % axes.length]
             + (Math.random() - 0.5) * 2 * spreadStep
             + Math.floor(i / axes.length) * spreadStep * (Math.random() < 0.5 ? -1 : 1)));
-        const sy = horizonYAt(sx, groundY) + 2;
+        // Born ON the crest line, not on the mountain's shadow face: the
+        // clamp in setAttackRun pins the birth depth to the ridge itself, so
+        // the craft pops over the silhouette and then descends inbound.
+        const sy = horizonYAt(sx, groundY) - 4;
         attacker.spawn(sy, null, sx, sx > aimX ? -1 : 1);
         // Kept gentle: a deep bow makes a run look near a site while its
         // path time says otherwise, and the kill order stops reading right.
@@ -1351,20 +1444,18 @@ function scheduleRaid() {
             const detected = detectionFrame(attacker, g);
             if (detected === null) continue;
 
-            // The engagement belongs to the site on the target's own SIDE:
-            // the one standing closest to its ingress - the early third of
-            // the run, where it comes over the ridge. A raider entering from
-            // the right is met by the right site, from the left by the left
-            // site - never by a rail across the screen - and the head-on
-            // gate below keeps the meet frontal. If that site has no
-            // achievable timing, the ingress re-rolls rather than the shot
-            // wandering to a flank.
-            const ingress = [];
-            for (let ss = 1; ss > 0.62; ss -= 1 / 24) ingress.push(attacker.posAt(ss));
-            const distToIngress = site =>
-                Math.min(...ingress.map(pt => Math.hypot(site.x - pt.x, site.y - pt.y)));
+            // The engagement belongs to the site closest to where the fight
+            // will happen: the middle of this attacker's run. That site is
+            // on the raid's own road - never a rail across the screen - and
+            // launching early from it meets the raider head-on, which the
+            // gate below still enforces. If it has no achievable timing, the
+            // ingress re-rolls rather than the shot wandering to a flank.
+            const midTrack = [];
+            for (let ss = 0.86; ss > 0.45; ss -= 1 / 24) midTrack.push(attacker.posAt(ss));
+            const distToTrack = site =>
+                Math.min(...midTrack.map(pt => Math.hypot(site.x - pt.x, site.y - pt.y)));
             const batteries = [...sites]
-                .sort((a, b) => distToIngress(a) - distToIngress(b))
+                .sort((a, b) => distToTrack(a) - distToTrack(b))
                 .slice(0, 1);
 
             // Only commit to timings the flight model confirms.
@@ -1373,21 +1464,33 @@ function scheduleRaid() {
 
             outer:
             for (const from of batteries) {
-                for (const delay of [0, 25, 55, 90, 130, 175, 225, 285, 350, 425, 510, 610, 720, 850, 1000, 1170, 1360]) {
+                for (const delay of [0, 20, 40, 65, 90, 115]) {
                     const launchFrame = Math.ceil(earliest + delay);
+                    // Systematic: the launch leaves within three seconds of
+                    // this track's detection, or the ingress re-rolls.
+                    if (launchFrame - detected > LAUNCH_DEADLINE) break;
                     const shot = flyEngagement(attacker, launchFrame, from, goodBaseSpeed);
                     // Contact must come with the nose near the horizon:
                     // climb to altitude first, finish the run level. The
                     // slope gate alone enforces it - a climbing contact is
                     // steeper than 0.42 by construction.
-                    // headOn <= -0.94: the two ground tracks close at 160
-                    // degrees or more at the planned merge (a few degrees of
-                    // live drift still lands frontal) - the system MEETS its
-                    // target, it never chases it down from the side.
-                    if (shot && insideCoverage(shot.x, shot.y, g, 0.94)
-                             && shot.sAtContact >= 0.25
+                    // headOn: the planner's floor on how opposed the merge
+                    // closes; the meeting-point law drives the real angle
+                    // far tighter than this safety bound.
+                    // sAtContact >= 0.6: most of the run must still be ahead
+                    // of the target when it dies, and the contact zone runs
+                    // out past the drawn footprint - kills land far forward,
+                    // out where the detection first marked them. dContact:
+                    // the kill closes strictly BEFORE the first city line -
+                    // the town watches the raid die out in the field, never
+                    // over its own roofs.
+                    if (shot && insideCoverage(shot.x, shot.y, g, 1.15)
+                             && shot.sAtContact >= 0.6
+                             && shot.dContact <= cityDepth - 0.1
                              && shot.slope <= 0.42
-                             && shot.headOn <= -0.94
+                             && shot.headOn <= -0.5
+                             && shot.drawnGap <= 1.2
+                             && shot.dU <= 2
                              && shot.at >= lastAt
                              && launchFrame >= lastLaunch) {
                         chosen = launchFrame;
@@ -1419,21 +1522,27 @@ function scheduleRaid() {
     }
 
     // Too few survivors: withdraw the wave.
-    if (placed > 0 && placed < (INSPECT ? 2 : 4)) {
+    if (placed < (INSPECT ? 2 : 4)) {
         pendingLaunches.splice(queuedBefore).forEach(L => {
             L.plane.reserved = false;
             L.target.active = false;
         });
+        return false;
     }
+    return true;
 }
 
-// Response delay, frames.
-const REACTION_FRAMES = 45;
+// The system's rhythm, in frames after a track's detection: three seconds
+// of early detection, then the interceptor is launched - never later than
+// six seconds. The guiding mark takes over at the launch itself.
+const REACTION_FRAMES = 180;
+const LAUNCH_DEADLINE = 360;
 
-// The network sees farther than it shoots: detection reaches beyond the
-// engagement footprint, so launches come early and the interceptor meets its
-// target in level cruise rather than mid-climb.
-const DETECT_MARGIN = 1.35;
+// Detection is line of sight to the REAL horizon: a track exists the
+// moment it crests the far ridge, wherever it crests - the network sees
+// everything the ground lets it see. Seeing is not shooting: the
+// engagement footprint still bounds where a kill may close.
+const DETECT_DEPTH = 0.015;   // past the ridge by this much = on the board
 
 // --- The world frame ---
 // Every craft lives in world coordinates: E = east (screen x, 1:1), d =
@@ -1471,37 +1580,34 @@ function steerInterceptor3D(st, tgt, tgtPrev, g) {
     const dN = (st.d - tgt.d) * NS;
     const hRange = Math.hypot(dE, dN);
 
-    // Azimuth: the turn rate answers the sightline's rotation, driving that
-    // rotation to zero so the two paths simply meet, while a small trim
-    // keeps the run pointed at its mark. The damper smooths the answer, and
-    // stiffens as the range closes so the endgame connects.
-    const lambda = Math.atan2(dN, dE);
-    let dLam = lambda - (st.prevLambda ?? lambda);
-    while (dLam >  Math.PI) dLam -= Math.PI * 2;
-    while (dLam < -Math.PI) dLam += Math.PI * 2;
-    st.prevLambda = lambda;
-    let dpsi = lambda - st.psi;
+    // Azimuth: fly at the meeting point on the target's own track. Launched
+    // early from the site on the raid's road, that line is the target's
+    // course reversed - so the merge closes head-on even though the
+    // interceptor left seconds after detection, long before the target
+    // turned in. On course the command is a constant; the critically damped
+    // spring settles onto it once, stiffening as the range closes.
+    const tvE = tgt.E - tgtPrev.E;
+    const tvN = (tgtPrev.d - tgt.d) * NS;
+    const vrad = hRange > 0.001 ? (tvE * dE + tvN * dN) / hRange : 0;
+    const closing = Math.max(st.baseSpeed - vrad, st.baseSpeed * 0.25);
+    const tGo = hRange / closing;
+    const psiCmd = Math.atan2(dN + tvN * tGo, dE + tvE * tGo);
+    let dpsi = psiCmd - st.psi;
     while (dpsi >  Math.PI) dpsi -= Math.PI * 2;
     while (dpsi < -Math.PI) dpsi += Math.PI * 2;
-    // The measured sightline rate is filtered before it steers - raw
-    // frame-to-frame rates carry track noise that would dither the turn.
-    st.dLamF = (st.dLamF ?? dLam) * 0.8 + dLam * 0.2;
-    const N = 4;                  // steering gain
-    const cmd = N * st.dLamF + 0.03 * dpsi;
-    const term = Math.max(0, Math.min(1, 1 - hRange / 400));
-    const blend = 0.1 * (1 + 2 * term);
-    st.turn = (st.turn || 0) * (1 - blend) + cmd * blend;
-    st.turn = Math.max(-0.05, Math.min(0.05, st.turn));
+    const w = 0.035 * (1 + 2.5 * Math.max(0, Math.min(1, 1 - hRange / 400)));
+    st.turn = (st.turn || 0) + w * w * dpsi - 2 * w * (st.turn || 0);
     st.psi += st.turn;
 
-    // Vertical: ride the 3D sightline itself. The vertical rate follows the
-    // line's slope to the target, so the nose points AT the threat in the
-    // picture - never above it - and the slope dies to zero as the
-    // altitudes meet: level at the merge. A first-order lag smooths the
-    // rate without ever overshooting it.
-    const dU = tgt.U - st.U;
-    const vUcmd = Math.max(-0.35, Math.min(0.35, dU / Math.max(hRange, 40))) * st.baseSpeed;
-    st.vU = (st.vU || 0) + (vUcmd - (st.vU || 0)) * 0.08;
+    // Vertical: climb first to the target's height, then hold it level into
+    // the hit. The command is the target's ACTUAL height - it only ever
+    // rises toward its cruise line, so the climb is monotonic and the two
+    // heights agree at the merge. A critically damped spring closes the
+    // climb early and never overshoots.
+    const ALT_W = 0.06;
+    const aU = ALT_W * ALT_W * (tgt.U - st.U)
+             - 2 * ALT_W * (st.vU || 0);
+    st.vU = (st.vU || 0) + aU;
     st.U += st.vU;
 
     // Advance over the ground at world speed.
@@ -1509,13 +1615,13 @@ function steerInterceptor3D(st, tgt, tgtPrev, g) {
     st.d -= Math.sin(st.psi) * st.baseSpeed / NS;
 }
 
-// The frame at which a track first crosses into the dome.
+// The frame at which a track first shows over the real horizon - judged on
+// its TRUE depth, so a craft still climbing out from behind the crest is
+// not yet on the board.
 function detectionFrame(attacker, g) {
     let s = 1;
     for (let f = 0; f < 8000; f++) {
-        const p = attacker.posAt(s);
-        // Visible once past the ridge and inside a footprint.
-        if (insideCoverage(p.x, p.y, g, DETECT_MARGIN)) return f;
+        if (attacker.depthOfS(s) >= DETECT_DEPTH) return f;
         s -= attacker.stepAt(s);
         if (s <= 0) return null;
     }
@@ -1559,9 +1665,15 @@ function flyEngagement(attacker, launchFrame, site, goodBaseSpeed) {
         if (flying) {
             steerInterceptor3D(st, tgt, tgtPrev, gGeom);
 
+            // The drawn track never descends, so terrain rolling under the
+            // flight leaves it floating a little above the world track. That
+            // debt must be paid back BEFORE the merge: reject timings where
+            // the drawn craft would still sit above its true height - and
+            // above the target - at the hit.
             const iyNow = groundScreenY(st.E, st.d, gGeom) - st.U;
             if (iyNow > minY + 1.2) return null;
             minY = Math.min(minY, iyNow);
+            const drawnGap = iyNow - minY;
 
             // Contact is a WORLD proximity - same place on the range, same
             // height over it - never a screen overlap between different
@@ -1578,7 +1690,9 @@ function flyEngagement(attacker, launchFrame, site, goodBaseSpeed) {
                               + Math.sin(st.psi) * tvN) / tv;
                 const iy = groundScreenY(st.E, st.d, gGeom) - st.U;
                 return { x: (tgt.x + st.E) / 2, y: (tgt.y + iy) / 2, at: f,
-                         sAtContact: sIm, headOn,
+                         sAtContact: sIm, headOn, drawnGap,
+                         dU: Math.abs(dU),
+                         dContact: tgt.d,
                          slope: Math.abs(st.vU) / st.baseSpeed };
             }
 
@@ -1600,10 +1714,21 @@ function animate(time) {
 
     // Waves form only when fully paired.
     // Raids come in waves: the sky clears, then the next one arrives.
-    if (planes.every(p => !p.active && !p.reserved) && pendingLaunches.length === 0) {
-        if (--raidCooldown <= 0) {
-            scheduleRaid();
-            raidCooldown = INSPECT ? 60 : 150 + Math.random() * 300;
+    // Waves ROLL: the next raid may crest while the last few of the
+    // previous one are still being run down - the sky never stands empty.
+    {
+        const aloft = planes.filter(p => p.active || p.reserved).length;
+        if (aloft <= 2 && pendingLaunches.length <= 2) {
+            if (--raidCooldown <= 0) {
+                const before = planes.filter(p => p.active || p.reserved).length;
+                scheduleRaid();
+                const formed = planes.filter(p => p.active || p.reserved).length > before;
+                // A roll that failed to form a wave retries almost at once -
+                // a failed roll must never cost the viewer a quiet spell.
+                raidCooldown = INSPECT ? 60
+                    : formed ? 60 + Math.random() * 130
+                    : 25;
+            }
         }
     }
 
